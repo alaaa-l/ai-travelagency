@@ -5,6 +5,7 @@ import streamlit as st
 from travel_workflow import get_travel_workflow_app
 
 workflow_app = get_travel_workflow_app()
+
 st.set_page_config(page_title="AI Travel Planner", layout="wide")
 st.title("🌍 AI Travel Planner")
 
@@ -28,12 +29,18 @@ if st.button("Plan My Trip"):
         "origin": origin,
         "date": date.strftime("%Y-%m-%d")
     }
+
+    # Initial state
     inputs = {"user_info": user_info, "messages": []}
 
     st.subheader("📝 Travel Planning Steps:")
+
+    # Stream through workflow steps
     for step_output in workflow_app.stream(inputs, {"recursion_limit": 10}):
+        # Extract messages from Annotated channel
         messages = step_output.get("messages", [])
         for msg in messages:
             if hasattr(msg, "content"):
                 st.text(msg.content)
+
     st.success("✅ Travel Plan Generated Successfully!")

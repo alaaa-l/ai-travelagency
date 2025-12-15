@@ -1,19 +1,21 @@
 from dotenv import load_dotenv
-
 load_dotenv()
-import os
+
 from langgraph.graph import StateGraph, END
 from typing import TypedDict
 from langchain_core.messages import HumanMessage, AIMessage
+
+
 from recommended_country_agent import recommend_country_agent
 from iata_resolver import get_main_iata_code
 from weather_agent import weather_agent
 from clothes_suggestion import clothes_suggestions
-
 from travel_cost_agent import get_travel_cost
-from rag import my_rag_collection
 
+from rag import get_rag_collection
 
+# Initialize RAG collection once
+rag_collection = get_rag_collection()
 
 def get_travel_workflow_app():
     # ---------------- Step 1: State Definition ----------------
@@ -25,11 +27,17 @@ def get_travel_workflow_app():
         clothes: str
         travel_cost: int
         itinerary: str
+        adjusted_itinerary: str  # separate key to avoid LangGraph conflict
         messages: list
+        rag_collection: any
+        budget_adjustments: int  # Track how many times we adjusted itinerary
 
     # ---------------- Step 2: Nodes Definition ----------------
     def user_input_node(state: TravelState):
-        return {"messages": [HumanMessage(content="User info received")], "next_step": "Country_Recommendation"}
+        return {
+            "messages": state.get("messages", []) + [HumanMessage(content="User info received")],
+            "next_step": "Country_Recommendation"
+        }
 
     def country_recommendation_node(state: TravelState):
         country = recommend_country_agent(
@@ -40,49 +48,72 @@ def get_travel_workflow_app():
         )
         return {
             "country": country,
-            "next_step": "IATA_Resolver",
-           "messages": [AIMessage(content=f"Recommended country: {country}")]
-        } 
-         
-
+            "messages": state.get("messages", []) + [AIMessage(content=f"Recommended country: {country}")],
+            "next_step": "IATA_Resolver"
+        }
 
     def iata_node(state: TravelState):
-        iata = get_main_iata_code(state['country'], rag_collection=my_rag_collection)
-        return {"iata_code": iata, "next_step": "Weather_Node",
-                "messages": [AIMessage(content=f"IATA: {iata}")]}
+        iata = get_main_iata_code(state['country'], rag_collection=state['rag_collection'])
+        return {
+            "iata_code": iata,
+            "messages": state.get("messages", []) + [AIMessage(content=f"IATA: {iata}")],
+            "next_step": "Weather_Node"
+        }
 
     def weather_node(state: TravelState):
         weather = weather_agent(state['country'])
-        return {"weather_summary": weather, "next_step": "Clothes_Node",
-                "messages": [AIMessage(content=f"Weather: {weather}")]}
+        return {
+            "weather_summary": weather,
+            "messages": state.get("messages", []) + [AIMessage(content=f"Weather: {weather}")],
+            "next_step": "Clothes_Node"
+        }
 
     def clothes_node(state: TravelState):
         clothes = clothes_suggestions(state['weather_summary'])
-        return {"clothes": clothes, "next_step": "Travel_Cost_Node",
-                "messages": [AIMessage(content=f"Clothes: {clothes}")]}
+        return {
+            "clothes": clothes,
+            "messages": state.get("messages", []) + [AIMessage(content=f"Clothes: {clothes}")],
+            "next_step": "Travel_Cost_Node"
+        }
 
     def travel_cost_node(state: TravelState):
         cost = get_travel_cost(state['user_info']['origin'], state['iata_code'], state['user_info']['date'])
-        return {"travel_cost": cost, "next_step": "Budget_Check_Node",
-                "messages": [AIMessage(content=f"Travel cost: {cost}")]}
+        return {
+            "travel_cost": cost,
+            "messages": state.get("messages", []) + [AIMessage(content=f"Travel cost: {cost}")],
+            "next_step": "Budget_Check_Node"
+        }
 
     def budget_check_node(state: TravelState):
+        # Limit max 1 adjustment to prevent infinite loop
+        adjustments = state.get("budget_adjustments", 0)
         budget = float(state['user_info']['budget'])
-        if state['travel_cost'] > budget:
-            return {"next_step": "Itinerary_Adjust_Node",
-                    "messages":[AIMessage(content="Budget exceeded, need to adjust itinerary")]}
-        return {"next_step": "Itinerary_Node",
-                "messages":[AIMessage(content="Budget OK")]}
+        if state['travel_cost'] > budget and adjustments < 1:
+            return {
+                "next_step": "Itinerary_Adjust_Node",
+                "budget_adjustments": adjustments + 1,
+                "messages": state.get("messages", []) + [AIMessage(content="Budget exceeded, adjusting itinerary")]
+            }
+        return {
+            "next_step": "Itinerary_Node",
+            "messages": state.get("messages", []) + [AIMessage(content="Budget OK")]
+        }
 
     def itinerary_node(state: TravelState):
         itinerary = f"Planned {state['user_info']['duration']}-day trip in {state['country']} with suggested activities."
-        return {"itinerary": itinerary, "next_step": "Supervisor_Node",
-                "messages":[AIMessage(content=itinerary)]}
+        return {
+            "itinerary": itinerary,
+            "messages": state.get("messages", []) + [AIMessage(content=itinerary)],
+            "next_step": "Supervisor_Node"
+        }
 
     def itinerary_adjust_node(state: TravelState):
-        itinerary = f"Adjusted {max(state['user_info']['duration']-1,1)}-day trip in {state['country']} to fit budget."
-        return {"itinerary": itinerary, "next_step": "Final_Summary_Node",
-                "messages":[AIMessage(content=itinerary)]}
+        adjusted_itinerary = f"Adjusted {max(state['user_info']['duration']-1,1)}-day trip in {state['country']} to fit budget."
+        return {
+            "adjusted_itinerary": adjusted_itinerary,
+            "messages": state.get("messages", []) + [AIMessage(content=adjusted_itinerary)],
+            "next_step": "Final_Summary_Node"
+        }
 
     def supervisor_node(state: TravelState):
         budget = float(state['user_info']['budget'])
@@ -91,15 +122,20 @@ def get_travel_workflow_app():
         return {"next_step": "Final_Summary_Node"}
 
     def final_summary_node(state: TravelState):
+        # Use adjusted itinerary if available
+        itinerary = state.get("adjusted_itinerary") or state.get("itinerary", "")
         summary = f"""
 Country: {state.get('country', '')}
 IATA: {state.get('iata_code', '')}
 Weather: {state.get('weather_summary', '')}
 Clothes: {state.get('clothes', '')}
 Travel Cost: {state.get('travel_cost', '')}
-Itinerary: {state.get('itinerary', '')}
+Itinerary: {itinerary}
 """
-        return {"messages":[AIMessage(content=summary)], "next_step": END}
+        return {
+            "messages": state.get("messages", []) + [AIMessage(content=summary)],
+            "next_step": END
+        }
 
     # ---------------- Step 3: Build Graph ----------------
     graph = StateGraph(TravelState)
